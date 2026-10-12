@@ -1,10 +1,12 @@
 #include "motor_control.hpp"
+#include "motor_units.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <thread>
+#include <cstring>
 #include <time.h>
 #include <pthread.h>
 #include <sched.h>
@@ -15,13 +17,35 @@ namespace myactua{
 #define CLOCK_TO_USE CLOCK_MONOTONIC
 
 namespace {
-constexpr double kPi = 3.14159265358979323846;
-constexpr double kPosPlusPerRev = 131072.0;
-constexpr double kRawPosToRad = (2.0 * kPi) / kPosPlusPerRev;
-constexpr double kRawVelToRpm = 60.0 / kPosPlusPerRev;
-constexpr double kRpmToRadPerSec = (2.0 * kPi) / 60.0;
-constexpr double kRawVelToRadPerSec = kRawVelToRpm * kRpmToRadPerSec;
+constexpr double kPi = myactua::motor_units::kPi;
+constexpr double kRawPosToRad = myactua::motor_units::kRawPosToRad;
+constexpr double kRawVelToRadPerSec = myactua::motor_units::kRawVelToRadPerSec;
 constexpr double kRadToDeg = 180.0 / kPi;
+
+bool is_18bit_ankle_motor(int motor_index)
+{
+    return myactua::motor_units::is_ankle_motor(motor_index);
+}
+
+double position_raw_scale(int motor_index)
+{
+    return is_18bit_ankle_motor(motor_index) ? 2.0 : 1.0;
+}
+
+double raw_pos_to_rad_for_motor(double raw, int motor_index)
+{
+    return myactua::motor_units::raw_pos_to_rad(raw, motor_index);
+}
+
+double raw_vel_to_rad_s_for_motor(double raw, int motor_index)
+{
+    return myactua::motor_units::raw_vel_to_rad_s(raw, motor_index);
+}
+
+double rad_s_to_raw_for_motor(double velocity_rad_s, int motor_index)
+{
+    return myactua::motor_units::rad_s_to_raw_vel(velocity_rad_s, motor_index);
+}
 
 int32_t double_to_i32(double value)
 {
@@ -144,6 +168,13 @@ bool MYACTUA::wait_all_slaves_ready(
 /* 电机实时控制线程 */
 void MYACTUA::rt_thread_func()
 {
+    while (running_ && !rt_start_permitted_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    if (!running_) {
+        return;
+    }
+
     struct timespec next_period;
     clock_gettime(CLOCK_TO_USE, &next_period);
     const long period_ns = 1000000;
@@ -178,6 +209,34 @@ void MYACTUA::process_commands()
 {
     ControlCommand cmd;
     while (cmd_queue_.pop(cmd, 0)) {
+        if (whole_body_fault_latched_.load(std::memory_order_acquire)) {
+            if (cmd.kind == ControlCommandKind::DISCRETE &&
+                cmd.discrete_type == DiscreteCommandType::RESTART &&
+                cmd.slave_index == ControlCommand::kAllSlaves) {
+                restart_all_requested_ = true;
+                recovery_healthy_count_ = 0;
+            } else if (cmd.kind == ControlCommandKind::DISCRETE &&
+                       cmd.discrete_type == DiscreteCommandType::STOP) {
+                // STOP remains an accepted safety command, but never clears the latch.
+                if (cmd.slave_index == ControlCommand::kAllSlaves) {
+                    applyWholeBodyQuickStop();
+                } else if (cmd.slave_index >= 0 &&
+                           cmd.slave_index < static_cast<int>(_motors.size())) {
+                    auto& motor = _motors[static_cast<std::size_t>(cmd.slave_index)];
+                    motor.desired.enabled = false;
+                    motor.tx.control_word = CMD_QUICK_STOP;
+                    motor.tx.target_pos = motor.rx.pos;
+                    motor.tx.target_vel = 0;
+                    motor.tx.target_torque = 0;
+                    motor.tx.pvt_kp = 0;
+                    motor.tx.pvt_kd = 0;
+                    _adapter->send(motor.slave_index, motor.tx);
+                }
+            }
+            // 故障锁存期间只接受 STOP 和全机 RESTART；其余命令全部丢弃。
+            continue;
+        }
+
         if (cmd.kind == ControlCommandKind::DISCRETE) {
             enqueue_discrete_command(cmd);
             continue;
@@ -239,9 +298,17 @@ void MYACTUA::enqueue_discrete_command(const ControlCommand& cmd)
     /* kAllSlaves 表示对所有电机执行命令 */
     if (cmd.slave_index == ControlCommand::kAllSlaves) {
         for (int i = 0; i < static_cast<int>(_motors.size()); ++i) {
+            if (cmd.discrete_type == DiscreteCommandType::STOP) {
+                discrete_cmd_queues_[i].clear();
+            }
             enqueue_one(i);
         }
     } else {
+        if (cmd.discrete_type == DiscreteCommandType::STOP &&
+            cmd.slave_index >= 0 &&
+            cmd.slave_index < static_cast<int>(_motors.size())) {
+            discrete_cmd_queues_[static_cast<std::size_t>(cmd.slave_index)].clear();
+        }
         enqueue_one(cmd.slave_index);
     }
 }
@@ -261,14 +328,30 @@ void MYACTUA::update(const std::vector<double> &setvalues)
             ++_motors[i].comm_offline_total_count;
         }
         _motors[i].comm_ok = comm_ok[i];
-        
+
         /* 只接受通信正常的电机数据 */
         if (comm_ok[i]) {
             _motors[i].rx = _adapter->receive(_motors[i].slave_index);
             refresh_observed_state(_motors[i]);
         }
+
+        _motors[i].prev_comm_ok = comm_ok[i];
     }
 
+    const EthercatBusHealthSnapshot health = _adapter->getBusHealth();
+    const bool process_data_ok =
+        health.master_link_up && health.wc_state == EC_WC_COMPLETE;
+    const bool all_motors_healthy =
+        process_data_ok && std::all_of(comm_ok.begin(), comm_ok.end(),
+                                       [](bool ok) { return ok; });
+    updateCommunicationWatchdog(all_motors_healthy, health);
+
+    if (whole_body_fault_latched_.load(std::memory_order_acquire)) {
+        applyWholeBodyQuickStop();
+        return;
+    }
+
+    /* 自动恢复已禁用：任何通信边沿都必须由上层显式全机 RESTART 处理。 */
     /* 处理离散命令 */
     service_discrete_commands(comm_ok);
 
@@ -298,6 +381,129 @@ void MYACTUA::update(const std::vector<double> &setvalues)
 }
 
 
+void MYACTUA::updateCommunicationWatchdog(
+    bool process_data_ok, const EthercatBusHealthSnapshot& health)
+{
+    if (whole_body_fault_latched_.load(std::memory_order_acquire)) {
+        if (!restart_all_requested_) {
+            recovery_healthy_count_ = 0;
+            return;
+        }
+
+        if (!process_data_ok) {
+            recovery_healthy_count_ = 0;
+            return;
+        }
+
+        ++recovery_healthy_count_;
+        if (recovery_healthy_count_ >= kCommWatchdogRecoveryCycles) {
+            clearCommunicationFault();
+            // 仅在健康窗口完成后启动显式全机恢复；故障前的命令已被丢弃。
+            enqueue_discrete_command(ControlCommand::Restart());
+        }
+        return;
+    }
+
+    if (process_data_ok) {
+        process_data_fail_count_ = 0;
+        // 必须连续完整足够久才算"真正稳定"：wait_all_slaves_ready() 返回的瞬间
+        // domain 状态可能恰好显示完整，随后 working counter 立刻回落，属启动假象。
+        if (!ever_process_data_ok_ && ++healthy_streak_ >= kStableHealthyCycles) {
+            ever_process_data_ok_ = true;
+        }
+        return;
+    }
+
+    // 尚未确认稳定前不判故障：从站逐个进入 OP 并开始 PDO 交换耗时可达数十秒，
+    // 期间 working counter 偏低属正常暂态。
+    if (!ever_process_data_ok_) {
+        healthy_streak_ = 0;
+        process_data_fail_count_ = 0;
+        return;
+    }
+
+    ++process_data_fail_count_;
+    if (process_data_fail_count_ >= kCommWatchdogFaultCycles) {
+        latchCommunicationFault(health);
+    }
+}
+
+void MYACTUA::latchCommunicationFault(const EthercatBusHealthSnapshot& health)
+{
+    if (whole_body_fault_latched_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    restart_all_requested_ = false;
+    recovery_healthy_count_ = 0;
+    fault_tick_ = discrete_cmd_tick_;
+    for (auto& queue : discrete_cmd_queues_) {
+        queue.clear();
+    }
+    cmd_queue_.clear();
+
+    std::cerr << "[MYACTUA] EtherCAT process-data fault latched at tick "
+              << fault_tick_ << ": link_up=" << (health.master_link_up ? 1 : 0)
+              << ", wc_state=" << static_cast<int>(health.wc_state)
+              << ", working_counter=" << health.working_counter
+              << ", ever_ok=" << (ever_process_data_ok_ ? 1 : 0)
+              << ", fail_count=" << process_data_fail_count_ << std::endl;
+}
+
+void MYACTUA::clearCommunicationFault()
+{
+    for (auto& queue : discrete_cmd_queues_) {
+        queue.clear();
+    }
+
+    for (auto& motor : _motors) {
+        motor.desired.enabled = false;
+        motor.mode_switch_step = ModeSwitchStep::IDLE;
+        resetMotorTargetsToFeedback(motor);
+    }
+
+    process_data_fail_count_ = 0;
+    recovery_healthy_count_ = 0;
+    restart_all_requested_ = false;
+    whole_body_fault_latched_.store(false, std::memory_order_release);
+
+    std::cout << "[MYACTUA] EtherCAT process-data fault cleared after explicit "
+                 "all-motor restart and healthy recovery." << std::endl;
+}
+
+void MYACTUA::applyWholeBodyQuickStop()
+{
+    for (auto& motor : _motors) {
+        motor.step = MotorStep::FAULT;
+        motor.desired.enabled = false;
+        motor.mode_switch_step = ModeSwitchStep::IDLE;
+        motor.tx.control_word = CMD_QUICK_STOP;
+        motor.tx.op_mode = motor.desired.mode;
+        motor.tx.target_pos = motor.rx.pos;
+        motor.tx.target_vel = 0;
+        motor.tx.target_torque = 0;
+        motor.tx.pvt_kp = 0;
+        motor.tx.pvt_kd = 0;
+        _adapter->send(motor.slave_index, motor.tx);
+    }
+}
+
+void MYACTUA::resetMotorTargetsToFeedback(MotorState& motor)
+{
+    motor.desired.setpoint =
+        raw_pos_to_rad_for_motor(motor.rx.pos, motor.slave_index) * kRadToDeg;
+    motor.desired.mit_setpoint = MitSetpoint(
+        motor.desired.setpoint, 0.0, 0.0, 0.0, 0.0);
+    motor.tx.control_word = CMD_DISABLE_OPERATION;
+    motor.tx.op_mode = motor.desired.mode;
+    motor.tx.target_pos = motor.rx.pos;
+    motor.tx.target_vel = 0;
+    motor.tx.target_torque = 0;
+    motor.tx.pvt_kp = 0;
+    motor.tx.pvt_kd = 0;
+}
+
+
 void MYACTUA::refresh_observed_state(MotorState& motor)
 {
     const uint16_t sw = motor.rx.status_word;
@@ -307,7 +513,7 @@ void MYACTUA::refresh_observed_state(MotorState& motor)
     motor.observed.ready_to_switch_on = is_ready_to_switch_on(sw);
     motor.observed.switched_on = is_switched_on(sw);
     motor.observed.operation_enabled = is_operation_enabled(sw);
-    motor.observed.fault = is_fault(sw) || (motor.rx.error != 0);
+    motor.observed.fault = is_fault(sw);
 }
 
 
@@ -350,8 +556,12 @@ void MYACTUA::service_discrete_commands(const std::vector<bool>& comm_ok)
             continue;
         }
 
-        /* 驱动明确报错，命令直接失败 */
+        /* 驱动明确报错，命令直接失败（RESTART 除外 — 让 process_single_motor 发 FAULT RESET） */
         if (motor.observed.fault) {
+            if (cmd.type == DiscreteCommandType::RESTART) {
+                cmd.stable_success_cycles = 0;
+                continue;
+            }
             cmd.phase = DiscretePhase::FAILED;
             cmd.fail_reason = kDiscreteFailFault;
             continue;
@@ -468,13 +678,15 @@ void MYACTUA::process_single_motor(MotorState& motor, double setvalue)
     if (observed.fault) {
         motor.step = MotorStep::FAULT;
         motor.mode_switch_step = ModeSwitchStep::IDLE;
-        motor.tx.control_word = CMD_SHUTDOWN;
         motor.tx.op_mode = desired.mode;
         motor.tx.target_pos = motor.rx.pos;
         motor.tx.target_vel = 0;
         motor.tx.target_torque = 0;
         motor.tx.pvt_kp = 0;
         motor.tx.pvt_kd = 0;
+        // desired.enabled ? 发 FAULT RESET (0x80) 让驱动退出 FAULT 态
+        //                 : 不使能则保持 shutdown
+        motor.tx.control_word = desired.enabled ? CMD_FAULT_RESET : CMD_SHUTDOWN;
         return;
     }
 
@@ -523,19 +735,25 @@ void MYACTUA::process_single_motor(MotorState& motor, double setvalue)
         motor.tx.pvt_kp = 0;
         motor.tx.pvt_kd = 0;
         switch (desired.mode) {
-            case ControlMode::CSV:  // rpm
-                motor.tx.target_vel = static_cast<int32_t>(setvalue / kRawVelToRpm);
+            case ControlMode::CSV:  // 速度命令：rad/s → 原始速度单位
+                motor.tx.target_vel = double_to_i32(
+                    rad_s_to_raw_for_motor(setvalue, motor.slave_index));
                 break;
             case ControlMode::CSP:  // setvalue: deg, 1 rev = 131072 plus
-                motor.tx.target_pos = static_cast<int32_t>((setvalue / kRadToDeg) / kRawPosToRad);
+                motor.tx.target_pos = double_to_i32(
+                    myactua::motor_units::rad_to_raw_pos(
+                        setvalue / kRadToDeg, motor.slave_index));
                 break;
             case ControlMode::CST:  // 电流百分比
                 motor.tx.target_torque = static_cast<int16_t>(setvalue);
                 break;
             case ControlMode::PVT: {
                 const MitSetpoint& mit = desired.mit_setpoint;
-                motor.tx.target_pos = double_to_i32((mit.position_deg / kRadToDeg) / kRawPosToRad);
-                motor.tx.target_vel = double_to_i32(mit.velocity_rad_s / kRawVelToRadPerSec);
+                motor.tx.target_pos = double_to_i32(
+                    myactua::motor_units::rad_to_raw_pos(
+                        mit.position_deg / kRadToDeg, motor.slave_index));
+                motor.tx.target_vel = double_to_i32(
+                    rad_s_to_raw_for_motor(mit.velocity_rad_s, motor.slave_index));
                 motor.tx.target_torque = double_to_i16(mit.torque_ff_permille);
                 motor.tx.pvt_kp = double_to_i32(mit.kp * 1000.0);
                 motor.tx.pvt_kd = double_to_i32(mit.kd * 1000.0);
@@ -724,7 +942,8 @@ std::vector<double> MYACTUA::get_joint_q_rad()
     const auto status = get_status();
     std::vector<double> q(status.size(), 0.0);
     for (std::size_t i = 0; i < status.size(); ++i) {
-        q[i] = raw_pos_to_rad(status[i].position);
+        q[i] = raw_pos_to_rad_for_motor(status[i].position,
+                                        status[i].slave_index);
     }
     return q;
 }
@@ -735,7 +954,8 @@ std::vector<double> MYACTUA::get_joint_vel_rad_s()
     const auto status = get_status();
     std::vector<double> dq(status.size(), 0.0);
     for (std::size_t i = 0; i < status.size(); ++i) {
-        dq[i] = raw_vel_to_rad_s(status[i].velocity);
+        dq[i] = raw_vel_to_rad_s_for_motor(status[i].velocity,
+                                           status[i].slave_index);
     }
     return dq;
 }
@@ -838,24 +1058,31 @@ void MYACTUA::print_motors_info(void){
             default: break;
         }
 
-        const double rx_pos_rad = static_cast<double>(m.rx.pos) * kRawPosToRad;
+        const double rx_pos_rad = raw_pos_to_rad_for_motor(
+            static_cast<double>(m.rx.pos), m.slave_index);
         const double rx_pos_deg = rx_pos_rad * kRadToDeg;
-        const double rx_vel_rpm = static_cast<double>(m.rx.vel) * kRawVelToRpm;
+        const double rx_vel_rad_s = raw_vel_to_rad_s_for_motor(
+            static_cast<double>(m.rx.vel), m.slave_index);
+        const double rx_vel_rpm = rx_vel_rad_s * 60.0 / (2.0 * kPi);
         char tx_target_info[64] = {};
         switch (m.tx.op_mode) {
             case ControlMode::PVT:
                 std::snprintf(tx_target_info, sizeof(tx_target_info), "p=%.6f kp=%.3f kd=%.3f",
-                    static_cast<double>(m.tx.target_pos) * kRawPosToRad,
+                    myactua::motor_units::raw_pos_to_rad(
+                        static_cast<double>(m.tx.target_pos), m.slave_index),
                     static_cast<double>(m.tx.pvt_kp) * 0.001,
                     static_cast<double>(m.tx.pvt_kd) * 0.001);
                 break;
             case ControlMode::CSP:
                 std::snprintf(tx_target_info, sizeof(tx_target_info), "%.6f rad",
-                    static_cast<double>(m.tx.target_pos) * kRawPosToRad);
+                    myactua::motor_units::raw_pos_to_rad(
+                        static_cast<double>(m.tx.target_pos), m.slave_index));
                 break;
             case ControlMode::CSV:
                 std::snprintf(tx_target_info, sizeof(tx_target_info), "%.3f rpm",
-                    static_cast<double>(m.tx.target_vel) * kRawVelToRpm);
+                    myactua::motor_units::raw_vel_to_rad_s(
+                        static_cast<double>(m.tx.target_vel), m.slave_index) *
+                    60.0 / (2.0 * kPi));
                 break;
             case ControlMode::CST:
                 std::snprintf(tx_target_info, sizeof(tx_target_info), "%d raw",
@@ -887,18 +1114,60 @@ void MYACTUA::print_motors_info(void){
 }
 
 
-void MYACTUA::start()
+bool MYACTUA::start()
 {
-    if (running_) return;
-    
+    if (running_) return rt_start_permitted_.load(std::memory_order_acquire);
+
     running_ = true;
+    rt_start_permitted_.store(false, std::memory_order_release);
     rt_thread_ = std::thread(&MYACTUA::rt_thread_func, this);
-    
-    struct sched_param param;
-    param.sched_priority = 80;
-    pthread_setschedparam(rt_thread_.native_handle(), SCHED_FIFO, &param);
-    
-    std::cout << "[MYACTUA] 实时控制线程已启动" << std::endl;
+
+    sched_param requested_param{};
+    requested_param.sched_priority = 80;
+    const int sched_result = pthread_setschedparam(
+        rt_thread_.native_handle(), SCHED_FIFO, &requested_param);
+
+    int actual_policy = SCHED_OTHER;
+    sched_param actual_param{};
+    const int verify_sched_result = pthread_getschedparam(
+        rt_thread_.native_handle(), &actual_policy, &actual_param);
+    const bool sched_ready = sched_result == 0 && verify_sched_result == 0 &&
+                             actual_policy == SCHED_FIFO &&
+                             actual_param.sched_priority == requested_param.sched_priority;
+
+    // 绑定到大核 cpu4，避免与 VS Code 等普通进程在 0-3 小核上竞争，
+    // 也避免调度器把实时线程放到不可预测的核上导致周期抖动。
+    cpu_set_t requested_cpuset;
+    CPU_ZERO(&requested_cpuset);
+    CPU_SET(4, &requested_cpuset);
+    const int affinity_result = pthread_setaffinity_np(
+        rt_thread_.native_handle(), sizeof(requested_cpuset), &requested_cpuset);
+
+    cpu_set_t actual_cpuset;
+    CPU_ZERO(&actual_cpuset);
+    const int verify_affinity_result = pthread_getaffinity_np(
+        rt_thread_.native_handle(), sizeof(actual_cpuset), &actual_cpuset);
+    const bool affinity_ready = affinity_result == 0 && verify_affinity_result == 0 &&
+                                CPU_ISSET(4, &actual_cpuset);
+
+    if (!sched_ready || !affinity_ready) {
+        std::cerr << "[MYACTUA] Failed to establish verified real-time control thread: "
+                  << "setsched=" << sched_result
+                  << ", getsched=" << verify_sched_result
+                  << ", policy=" << actual_policy
+                  << ", priority=" << actual_param.sched_priority
+                  << ", setaffinity=" << affinity_result
+                  << ", getaffinity=" << verify_affinity_result << std::endl;
+        running_ = false;
+        if (rt_thread_.joinable()) {
+            rt_thread_.join();
+        }
+        return false;
+    }
+
+    rt_start_permitted_.store(true, std::memory_order_release);
+    std::cout << "[MYACTUA] 实时控制线程已启动 (SCHED_FIFO prio=80, pinned cpu4)" << std::endl;
+    return true;
 }
 
 
@@ -907,6 +1176,7 @@ void MYACTUA::shutdown()
     if (!running_) return;
     
     running_ = false;
+    rt_start_permitted_.store(false, std::memory_order_release);
     if (rt_thread_.joinable()) {
         rt_thread_.join();
     }

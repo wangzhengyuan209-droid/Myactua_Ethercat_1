@@ -14,13 +14,9 @@
 
 namespace {
 
-#if POLICY_V3
 constexpr const char* kPolicyModelPath = "../model/policy_v3.pt";
-#else
-constexpr const char* kPolicyModelPath = "../model/policy.pt";
-#endif
 
-constexpr const char* kEthercatIfname = "enp8s0";
+constexpr const char* kEthercatIfname = "eth0";
 constexpr const char* kImuDevice = "/dev/ttyUSB0";
 constexpr int kImuBaudrate = 921600;
 
@@ -50,55 +46,66 @@ inference::RobotInterfaceConfig make_robot_config()
     cfg.ethercat_ifname = kEthercatIfname;
     cfg.imu_device      = kImuDevice;
     cfg.imu_baudrate    = kImuBaudrate;
+    cfg.imu_print_imu   = false;
+    cfg.imu_print_ahrs  = true;
+    cfg.imu_print_stats = false;
 
     cfg.policy_model_path = kPolicyModelPath;
 
-#if POLICY_V3
-    cfg.model_to_motor_index = {0, 1, 2, 3, 4, 5,
-                                6, 7, 8, 9, 11, 10};
-#else
-    cfg.model_to_motor_index = {0, 6, 1, 7, 2, 8,
-                                3, 9, 5, 10, 4, 11};
-#endif
+    cfg.print_motors_info = true;
     cfg.print_motor_ids = {0, 1, 2, 3, 4, 5,
                            6, 7, 8, 9, 10, 11};
-                           
-    cfg.motor_to_model_direction = {
-        1, -1,  1, 1,  1, -1,
-        1,  1,  1, 1, 1, 1
-    };
 
-    cfg.action_clip = 0.35;  // 模型原始输出动作的截断范围：[-action_clip, action_clip]
-    cfg.policy_cycle_time_s = 0.02;
+#if POLICY_V3
+    // 并联脚踝由 IK/FK 处理，因此这里只保留 8 个普通关节的物理电机映射。
+    cfg.model_to_motor_index = {0, 1, 2, 3, 6, 7, 8, 9};
+    cfg.left_ankle_parallel = {4, 5, 4, 5};      // L: pitch, roll, upper(M4), lower(M5)
+    cfg.right_ankle_parallel = {10, 11, 10, 11}; // R: pitch, roll, upper(M10), lower(M11)
+    // 参考学长配置，按物理电机顺序限制踝驱动链目标角度(rad)。
+    cfg.ankle_motor_min_rad = {-1.1, -1.1, -1.1, -1.1};
+    cfg.ankle_motor_max_rad = { 1.1,  1.1,  1.1,  1.1};
+#else
+    cfg.model_to_motor_index = {0, 1, 2, 3, 4, 5,
+                                6, 7, 8, 9, 10, 11};
+#endif
 
-    // 以下 12 维策略配置均按模型 DOF 序号填写；joint_min/max 是相对 stand_pose_rad 的偏移限位。
+    // 与训练一致：action_scale=0.25，部署安全限幅仍限制最终偏移。
+    cfg.action_clip.assign(12, {-0.10, 0.10});
+
+    // 训练配置的 action_scale=0.25；保留部署侧保守动作限幅，避免首次上机出现大幅动作。
+    cfg.action_scale.assign(12, 0.25);
+
+    cfg.joint_min_rad.assign(12, -1);
+    cfg.joint_max_rad.assign(12,  1.5);
+
+    cfg.policy_cycle_time_s = 0.4;  // gait cycle time, 和训练一致
+
+    // 与 walking 训练一致的默认姿态：hip_pitch=-0.3、knee_pitch=0.45、ankle_pitch=-0.15。
     cfg.stand_pose_rad = {
-    0.0, 0.0, 0.0,  0.0,
-    0.0, 0.0, 0.0,  0.0,
-    0.0, 0.0, 0.0, 0.0
+        0.0, -0.3, 0.0, 0.45, -0.15, 0.0,
+        0.0, -0.3, 0.0, 0.45, -0.15, 0.0
     };
 
     cfg.dof_pos_scale.assign(12, 1.0);
     cfg.dof_vel_scale.assign(12, 0.05);
 
-    // cfg.action_scale = {
-    // 0.08, 0.08, 0.3, 0.3,
-    // 0.08, 0.08, 0.3, 0.3,
-    // 0.15, 0.15, 0.08, 0.08
-    // };
-    cfg.action_scale.assign(12, 0.12);
-
-    cfg.joint_min_rad.assign(12, -1);
-    cfg.joint_max_rad.assign(12,  1.5);
+    cfg.motor_to_model_direction = {
+        -1, -1,  1,  1,  -1, -1,   // M0-M5: L_hip(roll,pitch,yaw,knee,ankle_up,ankle_low)
+        -1,  1,  1, -1,  -1, -1    // M6-M11: R_hip(roll,pitch,yaw,knee,ankle_low,ankle_up)
+    };
 
     /******************************************************************* */
 
-    cfg.command_scale = {0.1, 0.1, 0.1};
-    cfg.body_ang_vel_scale = {0.2, 0.2, 0.2};
+    cfg.command_scale = {2.0, 2.0, 1.0};
+    cfg.body_ang_vel_scale = {1.0, 1.0, 1.0};
     cfg.euler_scale = {1.0, 1.0, 1.0};
 
-    cfg.mit_kp.assign(12, 250);
-    cfg.mit_kd.assign(12, 10);
+    cfg.mit_kp = {220, 250, 220, 250, 20, 20, 220, 250, 220, 250, 20, 20};
+    cfg.mit_kd = {8, 10, 8, 10, 1, 1, 8, 10, 8, 10, 1, 1};
+
+    // ===== 并联脚踝配置（学长的 AnkleParallelMap 方式）=====
+    cfg.ankle_parallel_kinematics_enabled = true;
+
     return cfg;
 }
 
@@ -149,19 +156,7 @@ int main()
 
     inference::RobotInterface robot(cfg);
 
-    std::cout << "[INFO] Starting IMU...\n";
-    if (!robot.initial_and_start_imu()) {
-        std::cerr << "[ERROR] initial_and_start_imu() failed.\n";
-        return 1;
-    }
-
-    std::cout << "[INFO] Waiting 1 second for IMU/AHRS warmup...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (g_stop_requested.load()) {
-        safe_shutdown(robot);
-        return 0;
-    }
-
+    // 学长推荐的启动顺序：EtherCAT → load policy → restart(enable) → IMU → reset → 等站稳 → policy
     std::cout << "[INFO] Starting EtherCAT motors...\n";
     if (!robot.initial_and_start_motors()) {
         std::cerr << "[ERROR] initial_and_start_motors() failed.\n";
@@ -189,6 +184,20 @@ int main()
         return 0;
     }
 
+    std::cout << "[INFO] Starting IMU...\n";
+    if (!robot.initial_and_start_imu()) {
+        std::cerr << "[ERROR] initial_and_start_imu() failed.\n";
+        safe_shutdown(robot);
+        return 1;
+    }
+
+    std::cout << "[INFO] Waiting 1 second for IMU/AHRS warmup...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (g_stop_requested.load()) {
+        safe_shutdown(robot);
+        return 0;
+    }
+
     std::cout << "[INFO] Resetting joints to stand_pose_rad...\n";
     if (!robot.reset_joints()) {
         std::cerr << "[ERROR] reset_joints() failed.\n";
@@ -196,9 +205,11 @@ int main()
         return 1;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // 等待机器人站稳，之后进入策略循环
+    std::cout << "[INFO] Waiting 5s for stabilization, then 2s policy recording...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(5));
 
-    std::cout << "[INFO] Entering policy loop. Press Ctrl+C to stop.\n";
+    std::cout << "[INFO] Entering policy loop for 2 seconds. Will auto-exit.\n";
     using Clock = std::chrono::steady_clock;
     const auto period = std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>(kPolicyPeriodSec));
@@ -209,7 +220,8 @@ int main()
     double total_step_ms = 0.0;
     double max_step_ms = 0.0;
 
-    while (!g_stop_requested.load()) {
+    constexpr std::uint64_t kMaxSteps = 100;  // ~2 seconds at 50Hz
+    while (!g_stop_requested.load() && steps < kMaxSteps) {
         next_tick += period;
 
         const auto step_start = Clock::now();

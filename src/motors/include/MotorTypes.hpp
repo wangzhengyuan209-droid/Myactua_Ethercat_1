@@ -87,6 +87,7 @@ enum ControlWordCommand : uint16_t {
     CMD_SWITCH_ON = 0x0007,          // 0111：保持使能但停止运行
     CMD_DISABLE_OPERATION = 0x0007,  // 0111：保持使能，停止运行
     CMD_ENABLE_OPERATION = 0x000F,   // 1111：保持使能，正常运行
+    CMD_FAULT_RESET = 0x0080,        // 1000 0000：故障复位
 };
 
 /* 模式切换子状态 */

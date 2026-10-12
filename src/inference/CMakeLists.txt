@@ -1,15 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 project(robot_inference_hw_interface CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-option(POLICY_V3 "Build policy_test with policy_v3.pt input layout" OFF)
-if(POLICY_V3)
-    set(POLICY_V3_VALUE 1)
-else()
-    set(POLICY_V3_VALUE 0)
-endif()
+# POLICY_V3: 固定使用 V3 观测维度 (15帧×47=705)
+set(POLICY_V3_VALUE 1)
 
 set(LOCAL_LIBTORCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libtorch)
 set(LOCAL_PYTORCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/python_torch/torch)
@@ -97,3 +94,36 @@ add_executable(policy_test
     examples/policy_test.cpp
 )
 target_link_libraries(policy_test PRIVATE robot_interface)
+
+add_executable(standing_policy_test
+    examples/standing_policy_test.cpp
+)
+target_link_libraries(standing_policy_test PRIVATE robot_interface)
+
+add_executable(motors_test_single
+    examples/motors_test_single.cpp
+)
+target_link_libraries(motors_test_single PRIVATE robot_interface)
+
+add_executable(hold_test
+    examples/hold_test.cpp
+)
+target_link_libraries(hold_test PRIVATE robot_interface)
+
+# 不依赖 EtherCAT/Torch 的脚踝 FK/IK/Jacobian 主机测试。
+add_executable(ankle_jacobian_host_test
+    tests/ankle_jacobian_host_test.cpp
+)
+target_include_directories(ankle_jacobian_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+add_test(NAME ankle_jacobian_host_test COMMAND ankle_jacobian_host_test)
+
+# 不依赖 EtherCAT/Torch 的电机位置/速度单位往返测试。
+add_executable(motor_units_host_test
+    tests/motor_units_host_test.cpp
+)
+target_include_directories(motor_units_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../motors/include
+)
+add_test(NAME motor_units_host_test COMMAND motor_units_host_test)

@@ -272,6 +272,14 @@ void EthercatAdapterIGH::receivePhysical() {
     ecrt_master_receive(master);
     ecrt_domain_process(domain1);
 
+    ecrt_master_state(master, &master_state);
+    ecrt_domain_state(domain1, &domain1_state);
+    health_master_link_up.store(master_state.link_up != 0, std::memory_order_relaxed);
+    health_wc_state.store(static_cast<int>(domain1_state.wc_state),
+                          std::memory_order_relaxed);
+    health_working_counter.store(domain1_state.working_counter,
+                                 std::memory_order_relaxed);
+
     for (std::size_t i = 0; i < kNumSlaves; ++i) {
         ecrt_slave_config_state(sc[i], &sc_state[i]);
         const bool ok = sc_state[i].online && sc_state[i].operational;
@@ -311,15 +319,11 @@ void EthercatAdapterIGH::sendPhysical() {
                              (diag_interval_cycles > 0) &&
                              (cycle % diag_interval_cycles == 0);
     if (sample_diag) {
-        if (ecrt_domain_state(domain1, &domain1_state) < 0) {
-            std::printf("[ECAT_DIAG] cycle=%llu ecrt_domain_state failed\n",
-                        static_cast<unsigned long long>(cycle));
-        } else {
-            std::printf("[ECAT_DIAG] cycle=%llu wc=%u wc_state=%s\n",
-                        static_cast<unsigned long long>(cycle),
-                        domain1_state.working_counter,
-                        wc_state_to_string(domain1_state.wc_state));
-        }
+        ecrt_domain_state(domain1, &domain1_state);
+        std::printf("[ECAT_DIAG] cycle=%llu wc=%d wc_state=%s\n",
+                    static_cast<unsigned long long>(cycle),
+                    domain1_state.working_counter,
+                    wc_state_to_string(domain1_state.wc_state));
 
         for (std::size_t i = 0; i < kNumSlaves; ++i) {
             const SlaveOffsets& off = slave_offsets[i];
@@ -329,15 +333,17 @@ void EthercatAdapterIGH::sendPhysical() {
             const uint16_t sw = EC_READ_U16(domain1_pd + off.off_status_word);
             const uint16_t err = EC_READ_U16(domain1_pd + off.off_error);
             const int8_t op = EC_READ_S8(domain1_pd + off.off_mode_disp);
+            const int8_t tgt_mode = EC_READ_S8(domain1_pd + off.off_mode_of_op);
             std::printf(
                 "  M%zu send_cw=0x%04X send_cnt=%u pd_cw=0x%04X"
-                " status=0x%04X err=0x%04X op=%d cfg=%d\n",
+                " status=0x%04X err=0x%04X tgt_mode=%d op=%d cfg=%d\n",
                 i,
                 static_cast<unsigned>(app_cw),
                 static_cast<unsigned>(app_send_cnt),
                 static_cast<unsigned>(pd_cw),
                 static_cast<unsigned>(sw),
                 static_cast<unsigned>(err),
+                static_cast<int>(tgt_mode),
                 static_cast<int>(op),
                 slave_configured[i].load(std::memory_order_relaxed) ? 1 : 0);
         }
@@ -354,6 +360,16 @@ bool EthercatAdapterIGH::isConfigured(int index) {
         return false;
     }
     return slave_configured[index].load(std::memory_order_relaxed);
+}
+
+EthercatBusHealthSnapshot EthercatAdapterIGH::getBusHealth() const
+{
+    EthercatBusHealthSnapshot health;
+    health.master_link_up = health_master_link_up.load(std::memory_order_relaxed);
+    health.wc_state = static_cast<ec_wc_state_t>(
+        health_wc_state.load(std::memory_order_relaxed));
+    health.working_counter = health_working_counter.load(std::memory_order_relaxed);
+    return health;
 }
 
 

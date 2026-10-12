@@ -70,14 +70,15 @@ public:
         RxPDO rx;
 
         bool comm_ok;
+        bool prev_comm_ok;  // 上一周期的 comm_ok，用于检测 offline→online 切换
         uint32_t comm_offline_total_count;
-        
+
         bool print_info;
 
         MotorState(int index)
         : slave_index(index), desired(), observed(), step(MotorStep::IDLE),
           mode_switch_step(ModeSwitchStep::IDLE), tx({}), rx({}), comm_ok(false),
-          comm_offline_total_count(0), print_info(false) {}
+          prev_comm_ok(false), comm_offline_total_count(0), print_info(false) {}
     };
 
     MYACTUA(std::shared_ptr<EthercatAdapter> adapter, int num_motors);
@@ -91,7 +92,7 @@ public:
         int timeout_ms = 30000,
         int poll_ms = 100,
         const std::function<bool()>& should_stop = {}) const;
-    void start();  // 启动实时线程
+    bool start();  // 启动实时线程；实时调度/亲和性验证失败时返回 false
     void shutdown();  // 关闭实时线程
 
     std::vector<MotorStatusSnapshot> get_status();  // 获取电机状态快照
@@ -102,6 +103,9 @@ public:
     using StatusCallback = std::function<void(const std::vector<MotorStatusSnapshot>&)>;  // 电机状态快照回调函数
     void set_status_callback(StatusCallback cb);  // 设置电机状态快照回调函数
     bool is_running() const { return running_; }  // 是否正在运行实时线程
+    bool is_realtime_scheduling_ready() const noexcept {
+        return rt_start_permitted_.load(std::memory_order_acquire);
+    }
 
     /* 只打印存在于 slave_indices 中ID的电机信息 */
     void set_print_info(const std::vector<int>& slave_indices);
@@ -124,9 +128,29 @@ private:
     std::vector<std::deque<DiscreteCommand>> discrete_cmd_queues_;
     uint64_t discrete_cmd_tick_{0};  // 离散命令时间戳（按控制周期递增）
 
+    static constexpr uint32_t kCommWatchdogFaultCycles = 10;
+    static constexpr uint32_t kCommWatchdogRecoveryCycles = 10;
+    // 认定链路"真正稳定"所需的连续完整周期数（1 kHz 下约 2 秒）。
+    // 用于区分启动假象与真实稳定：wait_all_slaves_ready() 返回的瞬间 domain
+    // 状态可能恰好显示完整，随后 working counter 又回落。
+    static constexpr uint32_t kStableHealthyCycles = 2000;
+
     std::thread rt_thread_;
     std::atomic<bool> running_{false};  // 实时线程运行标志
-    
+    std::atomic<bool> rt_start_permitted_{false};
+
+    std::atomic<bool> whole_body_fault_latched_{false};
+    // PDO 交换是否已确认稳定（连续 kStableHealthyCycles 个周期完整）。
+    // 确认之前不启用通信看门狗：从站逐个进入 OP 并开始 PDO 交换可能耗时
+    // 数十秒，属正常暂态；此时若按故障锁存，会连带丢弃上层下发的 SET_MODE，
+    // 使驱动停在默认 CSP 而上层按 MIT/PVT 发目标。确认之后看门狗严格生效。
+    bool ever_process_data_ok_{false};
+    uint32_t healthy_streak_{0};   // 连续完整周期计数，一旦不完整立即清零
+    bool restart_all_requested_{false};
+    uint32_t process_data_fail_count_{0};
+    uint32_t recovery_healthy_count_{0};
+    uint64_t fault_tick_{0};
+
     std::vector<MotorStatusSnapshot> status_snapshot_;
 
     std::vector<int> print_motor_ids_;
@@ -144,6 +168,13 @@ private:
     void apply_discrete_command_to_motor(int motor_index, const DiscreteCommand& cmd);
     bool is_discrete_command_satisfied(const MotorState& motor, const DiscreteCommand& cmd) const;
 
+
+    void updateCommunicationWatchdog(
+        bool process_data_ok, const EthercatBusHealthSnapshot& health);
+    void latchCommunicationFault(const EthercatBusHealthSnapshot& health);
+    void clearCommunicationFault();
+    void applyWholeBodyQuickStop();
+    void resetMotorTargetsToFeedback(MotorState& motor);
 
     void refresh_observed_state(MotorState& motor);
 

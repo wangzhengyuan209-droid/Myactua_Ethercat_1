@@ -2,12 +2,16 @@
 #include "EthercatAdapterIGH.hpp"
 #include "imu_reader.hpp"
 #include "motor_control.hpp"
+#include "ankle_motor_ik.hpp"
+#include "ankle_motor_fk.hpp"
+#include "ankle_motor_jacobian.hpp"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,6 +32,12 @@ class TorchPolicyRunner;
 
 /* 接口层的配置结构体 */
 struct RobotInterfaceConfig {
+    struct AnkleParallelMap {
+        int model_pitch_dof = -1;
+        int model_roll_dof = -1;
+        int upper_motor_index = -1;
+        int lower_motor_index = -1;
+    };
 
     /* 电机 配置*/
     int num_motors = 12;
@@ -39,7 +49,7 @@ struct RobotInterfaceConfig {
     /* 是否在终端打印电机信息 */
     bool print_motors_info = false;  // false将 print_motor_ids 清零
     std::vector<int> print_motor_ids = {-1};  // 仅打印这些ID的电机信息，ID从0开始，-1表示全部
-    
+
     /* 相对 stand_pose_rad 的关节弧度偏移限制，按模型 DOF 序号填写 */
     std::vector<double> joint_min_rad;
     std::vector<double> joint_max_rad;
@@ -50,8 +60,6 @@ struct RobotInterfaceConfig {
     /* MIT/PVT 模式刚度/阻尼，必须由调用侧显式配置 */
     std::vector<double> mit_kp;
     std::vector<double> mit_kd;
-
-
 
     /* IMU 配置 */
     std::string imu_device = "/dev/ttyUSB0";
@@ -65,16 +73,18 @@ struct RobotInterfaceConfig {
     /* TorchScript 策略配置 */
     /* .pt 模型文件路径，由 torch.jit.script/trace 导出 */
     std::string policy_model_path;
-    /* 模型关节维度到电机逻辑索引的映射，长度必须为 12 且不可重复 */
+    /* 模型关节维度到电机逻辑索引的映射，长度必须为 12 且不可重复；并联脚踝驱动链由 AnkleParallelMap 指定 */
     std::vector<int> model_to_motor_index;
     /* 电机物理/控制器 ID 到模型关节方向的符号；1 表示方向一致，-1 表示方向相反；为空时全部按 1 */
     std::vector<int> motor_to_model_direction;
-    /* 网络原始输出动作的截断范围：[-action_clip, action_clip] */
-    double action_clip = 1.0;
-    /* 截断后的动作缩放系数，长度必须为 12；按模型 DOF 序号使用 */
+    /* 缩放后动作偏移的逐 DOF 截断范围：{lower, upper}；按模型 DOF 序号使用 */
+    std::vector<std::array<double, 2>> action_clip;
+    /* 模型原始输出动作的缩放系数，长度必须为 12；按模型 DOF 序号使用 */
     std::vector<double> action_scale;
     /* 步态相位周期，单位 s；phase = fmod(elapsed / policy_cycle_time_s, 1) */
     double policy_cycle_time_s = 0.02;
+    /* 站立策略使用训练时固定的 phase=(sin=0, cos=1)。 */
+    bool fixed_policy_phase = false;
     /* DOF Pos 缩放，长度必须为 12；按模型 DOF 序号使用 */
     std::vector<double> dof_pos_scale;
     /* DOF Vel 缩放，长度必须为 12；按模型 DOF 序号使用 */
@@ -97,6 +107,25 @@ struct RobotInterfaceConfig {
         1,
         1
     };
+
+    /* 是否启用脚踝并联机构运动学；启用后 action 走 IK，observation 走 FK */
+    bool ankle_parallel_kinematics_enabled = false;
+    /* 并联脚踝显式映射：模型姿态 DOF 与两条物理驱动链电机分开配置 */
+    AnkleParallelMap left_ankle_parallel;
+    AnkleParallelMap right_ankle_parallel;
+    /* 可选的物理踝电机角度限位，顺序为左 upper/lower、右 upper/lower */
+    std::array<double, 4> ankle_motor_min_rad = {
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()
+    };
+    std::array<double, 4> ankle_motor_max_rad = {
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity()
+    };
 };
 
 
@@ -118,12 +147,16 @@ public:
     bool restart_motors(int slave_index = -1);
     void deinit_motors();
     bool apply_action(const std::vector<double>& target_q_model_rad);  // 模型 DOF 顺序目标角(rad)
+    bool send_motor_rad(const std::vector<double>& target_rad);  // 直接发电机目标(rad)，跳过模型映射
     bool reset_joints();  // /* 复位到模型 DOF 顺序配置的 stand_pose_rad，单位为 rad */
 
     bool is_motors_initialized() const { return motors_initialized_.load(); }
     std::vector<double> get_joint_q() const;    // rad
     std::vector<double> get_joint_vel() const;  // rad/s
     std::vector<double> get_joint_tau() const;  // raw driver unit
+    std::vector<bool> get_motor_comm_status() const;  // 每个电机的通信状态
+    void calibrate_encoder_zero();  // 标定当前编码器位置为零位
+    void set_motor_target_offset(const std::vector<double>& offset);  // 设置电机目标偏移（model_dof顺序）
 
 
     /* IMU部分 */
@@ -142,6 +175,9 @@ public:
     bool load_policy();
     void unload_policy();
     void reset_policy_state();
+    void set_target_velocity(double vx, double vy, double yaw_rate);
+    std::array<double, 3> get_target_velocity() const;
+    bool policy_step();
     bool policy_step(double vx, double vy, double yaw_rate);
 
 
@@ -186,7 +222,17 @@ private:
 
     /*  Policy 运行器 智能指针 */
     std::unique_ptr<TorchPolicyRunner> policy_runner_;
+
+    // 编码器零偏（calibrate_encoder_zero 后生效）
+    std::vector<double> encoder_home_offset_;
+    bool encoder_calibrated_ = false;
+
+    // 电机目标偏移（用于 stand_test 过渡到直立）
+    std::vector<double> motor_target_offset_;
+
     mutable std::mutex policy_mutex_;
+    mutable std::mutex target_velocity_mutex_;
+    std::array<double, 3> target_velocity_{0.0, 0.0, 0.0};  // [vx, vy, yaw_rate]
     std::array<float, kPolicyDof> last_action_raw_{};  // 记录上一周期动作值
     std::array<float, kPolicyObservationSize> observation_history_{};
     bool observation_history_ready_ = false;
@@ -201,10 +247,24 @@ private:
     bool validate_policy_config() const;
     bool build_action_target_rad(const std::vector<double>& target_q_model_rad,
                                  std::vector<double>& target_rad) const;
+    bool is_parallel_ankle_model_dof(int model_index) const;
+    int direct_model_mapping_slot(int model_index) const;
     bool build_policy_observation(double vx,
                                   double vy,
                                   double yaw_rate,
                                   std::array<float, kPolicyObservationSize>& observation);
+    bool build_joint_observation_terms(const std::vector<double>& q_rad,
+                                       const std::vector<double>& dq_rad_s,
+                                       std::array<float, kPolicyDof>& joint_pos_rel,
+                                       std::array<float, kPolicyDof>& joint_vel_rel);
+    bool apply_ankle_fk_observation(
+        const std::vector<double>& q_rad,
+        const std::vector<double>& dq_rad_s,
+        const RobotInterfaceConfig::AnkleParallelMap& ankle_map,
+        ankle_motor_fk::Solver& solver,
+        std::array<float, kPolicyDof>& joint_pos_rel,
+        std::array<float, kPolicyDof>& joint_vel_rel);
+    void reset_ankle_fk_state();
     void reset_policy_observation_log();
     bool ensure_policy_observation_log();
     void log_policy_observation_frame(
@@ -215,6 +275,29 @@ private:
                            const std::vector<double>& target_q_model_rad,
                            const std::vector<double>& target_rad);
     bool handle_policy_step_failure(const std::string& message);
+
+    /* 脚踝 IK 求解器（左右各一），状态跨 policy_step 保持 */
+    mutable ankle_motor_ik::Solver left_ankle_solver_;
+    mutable ankle_motor_ik::Solver right_ankle_solver_;
+    /* 上一次成功求解的驱动链电机角度（弧度），用于不可达时回退 */
+    mutable double left_ankle_last_upper_motor_ = 0.0;
+    mutable double left_ankle_last_lower_motor_ = 0.0;
+    mutable double right_ankle_last_upper_motor_ = 0.0;
+    mutable double right_ankle_last_lower_motor_ = 0.0;
+    mutable bool left_ankle_solved_ = false;
+    mutable bool right_ankle_solved_ = false;
+
+    /* 脚踝 FK 求解器：真实电机反馈 -> 脚踝 roll/pitch observation */
+    ankle_motor_fk::Solver left_ankle_fk_solver_;
+    ankle_motor_fk::Solver right_ankle_fk_solver_;
+
+    /* 对单条腿的脚踝并联机构执行逆解，将 roll/pitch 转为两个电机角度 */
+    bool apply_ankle_ik(const std::vector<double>& target_q_model_rad,
+                        std::vector<double>& target_rad,
+                        const RobotInterfaceConfig::AnkleParallelMap& ankle_map,
+                        ankle_motor_ik::Solver& solver,
+                        double& last_upper_motor, double& last_lower_motor,
+                        bool& solved) const;
 };
 
 }  // namespace inference

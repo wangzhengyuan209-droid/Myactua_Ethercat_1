@@ -21,3 +21,6 @@ src/inference/third_party/
 *.so
 *.out
 *.exe
+
+# Local model backup files
+*.bak
